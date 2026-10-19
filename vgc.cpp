@@ -30,7 +30,7 @@ static void Log(const std::wstring& msg) {
             std::wstring path(exePath);
             size_t lastSlash = path.find_last_of(L"\\/");
             if (lastSlash != std::wstring::npos) {
-                path = path.substr(0, lastSlash + 1) + L"vService.log";
+                path = path.substr(0, lastSlash + 1) + L"vgc.log";
 
                 DeleteFileW(path.c_str());
 
